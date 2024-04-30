@@ -100,7 +100,7 @@ const institutionCodeMap = {
 
 
 // API endpoint to upload CSV file and automate form submission
-app.post('/upload', upload.single('file'), async (req, res) => {
+app.post('/', upload.single('file'), async (req, res) => {
     if (!req.file) {
         return res.status(400).send('No file uploaded. Please upload a file.');
     }
@@ -165,7 +165,7 @@ async function processCSVAndGenerateTxt(results, res) {
     const filePath = `${txtFilePath}`;
 
     // Launch Puppeteer and navigate to the form URL
-    const browser = await puppeteer.launch({ headless: false }); // Launch browser
+    const browser = await puppeteer.launch({ headless: true }); // Launch browser
     const page = await browser.newPage(); // Open new tab
     try {
 
