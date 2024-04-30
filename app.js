@@ -5,7 +5,12 @@ const puppeteer = require('puppeteer');
 const axios = require('axios');
 const app = express();
 const port = 3000;
-const csv = require('csv-parser'); // Import csv-parser module
+const csv = require('csv-parser');
+const unzipper = require('unzipper');
+const path = require('path');
+const xml2js = require('xml2js');
+const { v4: uuidv4 } = require('uuid');
+const fsExtra = require('fs-extra');
 
 // Set up multer to handle file uploads
 const upload = multer({ dest: 'uploads/' });
@@ -139,11 +144,10 @@ app.listen(port, () => {
 });
 
 async function processCSVAndGenerateTxt(results, res) {
-    // Remove the headers (first row)
-    results.shift();
 
-    const fs = require('fs');
-    const txtFilePath = 'txts/output.txt';
+    const txtFileName = uuidv4();
+    const txtFilePath = `txts/${txtFileName}.txt`;
+    const zipFolderPath = path.resolve('zips');
     const stream = fs.createWriteStream(txtFilePath, { flags: 'a' });
 
     // Iterate over each row in the results
@@ -159,7 +163,6 @@ async function processCSVAndGenerateTxt(results, res) {
         // Write the row to the text file
         stream.write(`${fecha},${claveRastreo},${emisora},${receptora},${cuenta},${cargos}\n`);
     });
-
     stream.end();
 
     const filePath = `${txtFilePath}`;
@@ -170,6 +173,13 @@ async function processCSVAndGenerateTxt(results, res) {
         executablePath: '/usr/bin/chromium-browser' 
     }); // Launch browser
     const page = await browser.newPage(); // Open new tab
+
+    const client = await page.createCDPSession();
+    await client.send('Page.setDownloadBehavior', {
+        behavior: 'allow',
+        downloadPath: zipFolderPath
+    });
+
     try {
 
         await page.goto('https://www.banxico.org.mx/cep-scl/inicio.do'); // Navigate to the form URL
@@ -178,7 +188,7 @@ async function processCSVAndGenerateTxt(results, res) {
         await input.uploadFile(filePath);
 
         // Fill in the email input field
-        await page.type('input[name="correo"]', 'aaronaguilar12721@gmail.com');
+        await page.type('input[name="correo"]', 'aaron@vulcanics.mx');
 
         // Select the second option "XML" from the dropdown
         await page.select('select[name="formato"]', '2');
@@ -201,7 +211,6 @@ async function processCSVAndGenerateTxt(results, res) {
                 return tokenElements.length > 1 ? tokenElements[1].innerText.trim() : null;
             });
 
-            console.log("TOKEN: " + token)
             if (!token) {
                 // If token is not found, go back and retry
                 await page.goBack();
@@ -213,7 +222,7 @@ async function processCSVAndGenerateTxt(results, res) {
             await page.goBack();
             await page.click('a.boton[href="inicio2.do"]');
 
-            await page.type('input[name="correo"]', 'aaronaguilar12721@gmail.com');
+            await page.type('input[name="correo"]', 'aaron@vulcanics.mx');
             await page.type('input[name="token"]', token);
 
             let data = null;
@@ -228,16 +237,42 @@ async function processCSVAndGenerateTxt(results, res) {
                 // Check if the processing message form is present
                 const processingMessageForm = await page.$('form.styled.horizontal[style*="padding:20px;"]');
                 if (processingMessageForm) {
-                    console.log('Data is still processing. Retrying...');
                     // If data is still processing, wait for a few seconds before retrying
                     await page.goBack();
                     await new Promise(resolve => setTimeout(resolve, 3000));
                 } else {
-                    console.log('Data is ready for download.');
-                    res.send('Data is ready for download.');
-                    data="bullshit"
-                    await page.click('input[type="button"][value="Descargar"]');
-                    
+                    data = true;
+                    page.click('input[type="button"][value="Descargar"]');
+
+                    await waitUntilDownload(page, token + '.zip');
+                    browser.close();
+
+                    fs.unlink(txtFilePath, (err) => {
+                        if (err) {
+                            console.error('Error while deleting text file:', err);
+                        }
+                    });
+
+                    unzipFile(zipFolderPath + "/" + token + ".zip", zipFolderPath + "/" + token + "/")
+                        .then(() => {
+                            fs.unlink(zipFolderPath + "/" + token + ".zip", (err) => {
+                                if (err) {
+                                    console.error('Error while deleting zip file:', err);
+                                }
+                            });
+                            compareTransactions(results, zipFolderPath + "/" + token + "/")
+                                .then(resString => {
+                                    res.status(200).send(resString);
+                                })
+                                .catch(error => {
+                                    console.error('Error during transaction comparison:', error);
+                                    res.status(500).send('Error during transaction comparison');
+                                });
+                        })
+                        .catch(error => {
+                            console.error('Error while unzipping file:', error);
+                            res.status(500).send('Error while unzipping file');
+                        });
                 }
             }
 
@@ -251,7 +286,105 @@ async function processCSVAndGenerateTxt(results, res) {
     }
 }
 
+// Function to unzip the downloaded file
+async function unzipFile(zipFilePath, outputFolderPath) {
+    // Ensure that the output folder exists
+    if (!fs.existsSync(outputFolderPath)) {
+        fs.mkdirSync(outputFolderPath, { recursive: true });
+    }
 
+    // Extract files from the zip archive
+    await fs.createReadStream(zipFilePath)
+        .pipe(unzipper.Extract({ path: outputFolderPath }))
+        .promise();
+}
+
+async function waitUntilDownload(page, fileName = '') {
+    return new Promise((resolve, reject) => {
+        page._client().on('Page.downloadProgress', e => { // or 'Browser.downloadProgress'
+            if (e.state === 'completed') {
+                resolve(fileName);
+            } else if (e.state === 'canceled') {
+                reject();
+            }
+        });
+    });
+}
+
+
+async function compareTransactions(results, zipFolderPath) {
+    // Iterate over each result
+    let responseString = '';
+    for (const row of results) {
+
+
+        const claveRastreo = row.ClaveRastreo;
+
+        const fecha = row.Fecha;
+        const emisora = row.Emisora;
+        const receptora = row.Receptora;
+        const cuenta = row.Cuenta;
+        const cargos = row.Cargos;
+
+        const xmlFileName = `[${row.Fecha}]${claveRastreo}.xml`;
+        const xmlFilePath = path.join(zipFolderPath, xmlFileName);
+
+        try {
+            const xmlExists = fs.existsSync(xmlFilePath);
+
+            if (xmlExists) {
+                // Read XML file
+                const xmlData = fs.readFileSync(xmlFilePath, 'utf8');
+                // Convert XML to JSON
+                const parser = new xml2js.Parser();
+                const jsonData = await parser.parseStringPromise(xmlData);
+
+                // Extract relevant data from JSON
+                const xmlClaveRastreo = jsonData.SPEI_Tercero.$.claveRastreo;
+                const xmlFecha = jsonData.SPEI_Tercero.$.FechaOperacion;
+                const xmlCuenta = jsonData.SPEI_Tercero.Beneficiario[0].$.Cuenta;
+                const xmlCargo = parseFloat(jsonData.SPEI_Tercero.Beneficiario[0].$.MontoPago).toFixed(2);
+
+                const xmlEmisora = (jsonData.SPEI_Tercero.Ordenante[0].$.BancoEmisor === "BBVA BANCOMER") ? "BBVA MEXICO" : jsonData.SPEI_Tercero.Ordenante[0].$.BancoEmisor;
+
+                const xmlReceptora = (jsonData.SPEI_Tercero.Beneficiario[0].$.BancoReceptor === "BBVA BANCOMER") ? "BBVA MEXICO" : jsonData.SPEI_Tercero.Beneficiario[0].$.BancoReceptor;
+
+                let compareData = claveRastreo === xmlClaveRastreo;
+                compareData = xmlFecha === fecha;
+
+                compareData = xmlEmisora === emisora;
+                compareData = xmlReceptora === receptora;
+                compareData = xmlCuenta === cuenta;
+                compareData = xmlCargo === parseFloat(cargos).toFixed(2);
+
+
+                // Compare the ClaveRastreo from the CSV with the one from the XML
+                if (compareData) {
+                    // Perform further comparison or processing if needed
+                    responseString = responseString + claveRastreo + ",true;"
+
+                } else {
+                    responseString = responseString + claveRastreo + ",false;"
+                }
+            } else {
+                // XML file does not exist, update response string to false
+                responseString = responseString + claveRastreo + ",false;";
+            }
+        } catch (error) {
+            console.error(`Error while comparing transaction ${claveRastreo} with XML:`, error);
+            // Handle error if needed
+        }
+    }
+
+    // After processing all XML files, delete the folder
+    try {
+        await fsExtra.remove(zipFolderPath);
+    } catch (error) {
+        console.error('Error while deleting folder:', error);
+    }
+    console.log(responseString)
+    return responseString;
+}
 
 //Single spei request (FAILS A LOT WHEN MULTIPLE REQUESTS ARE DONE AT THE SAME TIME)
 /*
