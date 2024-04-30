@@ -165,7 +165,10 @@ async function processCSVAndGenerateTxt(results, res) {
     const filePath = `${txtFilePath}`;
 
     // Launch Puppeteer and navigate to the form URL
-    const browser = await puppeteer.launch({ headless: true }); // Launch browser
+    const browser = await puppeteer.launch({ 
+        headless: true, 
+        executablePath: '/usr/bin/chromium-browser' 
+    }); // Launch browser
     const page = await browser.newPage(); // Open new tab
     try {
 
